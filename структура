@@ -1,0 +1,32 @@
+импорты
+настройка логирования
+настройка подключения
+параметры торговли
+параметры индикатора
+запрос позиций, проверка сделок, фильтрация, получение деталей
+positions = bybit.fetch_positions([SYMBOL])
+
+======функции========
+def fetch_ohlcv(symbol, timeframe='15m', limit=200):
+
+def ema(series, length):
+
+def calc_obv(df):
+
+def calc_macd(series, fast=12, slow=24, signal=9):
+
+def get_position_side():
+
+def close_position():
+
+def open_position(direction):
+
+def run_bot_once():
+
+def log_to_file(message):
+
+if __name__ == "__main__":
+    
+    while True:
+        
+
