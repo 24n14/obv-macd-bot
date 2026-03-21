@@ -3,6 +3,7 @@ import asyncio
 import ccxt.pro as ccxt
 import pandas as pd
 import numpy as np
+import requests
 #import time
 #from typing import Literal
 import config
@@ -13,11 +14,11 @@ proxy_settings = {
     'host': config.PROXY_HOST,
     'port': config.PROXY_PORT,
     'user': config.PROXY_USER,
-    'pass': config.PROXY_PASS
+    'password': config.PROXY_PASS
 }
 notifier = TelegramNotifier(config.TG_TOKEN,
                             config.TG_CHAT_ID,
-                            proxy_data=proxy_settings)
+                            proxy_data=proxy_settings if config.USE_PROXY else None)
 #==== Настройка логирования====
 logging.basicConfig(
     level=logging.INFO,
@@ -30,19 +31,31 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.info("Бот запущен и готов к работе.")
 
-
+#<===ПОДКЛЮЧЕНИЕ К ПРОКСИ===>
+proxy_url = f"http://{config.PROXY_USER}:{config.PROXY_PASS}@{config.PROXY_HOST}:{config.PROXY_PORT}"
+# Определяем конфиг прокси (если выключено — будет None)
+proxies_config = {
+    'http': proxy_url,
+    'https': proxy_url,
+} if config.USE_PROXY else None
 # ===== ПОДКЛЮЧЕНИЕ К BYBIT =====
+test_ip = requests.get('https://api.ipify.org', proxies={'https': proxy_url}).text
+logger.info(f"Внешний IP через прокси: {test_ip}")
 # 1. Создаем объект (это всё еще синхронная операция, в интернет не идет)
 bybit = ccxt.bybit({
     'apiKey': config.API_KEY,
     'secret': config.SECRET_KEY,
     'enableRateLimit': True,
+    'proxies': proxies_config,
     'options': {
         'defaultType': 'linear',  # Указываем тип контрактов (USDT-бессрочные)
         'recvWindow': 5000        # Окно задержки для безопасности
     }
 })
-
+if proxies_config:
+    logger.info("Работа через прокси включена.")
+else:
+    logger.info("Работа напрямую (без прокси).")
 # 2. Включаем демо-режим по рекомендации техподдержки
 if config.ENABLE_DEMO:
     bybit.enable_demo_trading(True)
