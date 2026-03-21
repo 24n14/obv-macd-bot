@@ -1,212 +1,343 @@
-import ccxt
+import logging
+import asyncio
+import ccxt.pro as ccxt
 import pandas as pd
 import numpy as np
-import time
-import logging
-from typing import Literal
+#import time
+#from typing import Literal
+import config
+from info_in_telegram import TelegramNotifier
 
 #====Импортируем все настройки из нашего файла config.py====
-import config
-
+proxy_settings = {
+    'host': config.PROXY_HOST,
+    'port': config.PROXY_PORT,
+    'user': config.PROXY_USER,
+    'pass': config.PROXY_PASS
+}
+notifier = TelegramNotifier(config.TG_TOKEN,
+                            config.TG_CHAT_ID,
+                            proxy_data=proxy_settings)
 #==== Настройка логирования====
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - [%(name)s] - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("bot_history.log", encoding='utf-8'),
         logging.StreamHandler()
     ]
     )
-logging.info("Бот запущен и готов к работе.")
 logger = logging.getLogger(__name__)
+logger.info("Бот запущен и готов к работе.")
+
 
 # ===== ПОДКЛЮЧЕНИЕ К BYBIT =====
+# 1. Создаем объект (это всё еще синхронная операция, в интернет не идет)
 bybit = ccxt.bybit({
     'apiKey': config.API_KEY,
     'secret': config.SECRET_KEY,
     'enableRateLimit': True,
     'options': {
-        'defaultType': 'linear',
-        'recvWindow': 5000
+        'defaultType': 'linear',  # Указываем тип контрактов (USDT-бессрочные)
+        'recvWindow': 5000        # Окно задержки для безопасности
     }
 })
 
-bybit.enable_demo_trading(config.ENABLE_DEMO)
-bybit.options['defaultType'] = 'linear'
+# 2. Включаем демо-режим по рекомендации техподдержки
+if config.ENABLE_DEMO:
+    bybit.enable_demo_trading(True)
+    logger.info("Режим Demo-торговли Bybit активирован.")
+
+# 3. Твоя важная строчка (Явное подтверждение типа рынка)
+bybit.options['defaultType'] = 'linear' 
+
+# Профессорская заметка:
+# Теперь любая команда к этому объекту (например, fetch_balance) 
+# ДОЛЖНА выполняться внутри асинхронной функции.
 
 # ========== ЗАПРОС БАЛАНСА ==========
-balance = bybit.fetch_balance()
-# Безопасный способ получить USDT (вернет 0, если ключа нет)
-usdt_balance = balance['total'].get('USDT', 0)
-
-if usdt_balance == 0:
+async def get_detailed_balance():
     try:
-        usdt_balance = float(balance['info']['result']['list'][0]['coin'][0]['equity'])
-    except (KeyError, IndexError):
-        usdt_balance = 0
-logging.info(f"Рабочий баланс: {usdt_balance} USDT")
+        balance = await bybit.fetch_balance()
+        
+        # Свободные средства (для новых сделок)
+        free_usdt = balance['free'].get('USDT', 0)
+        
+        # Общий капитал (ваша "стоимость" на бирже)
+        total_usdt = balance['total'].get('USDT', 0)
+        
+        # Запасной вариант для специфики Bybit (Unified Account)
+        if total_usdt == 0:
+            try:
+                # На Unified аккаунтах смотрим equity
+                coin_data = balance['info']['result']['list'][0]['coin'][0]
+                total_usdt = float(coin_data['equity'])
+                free_usdt = float(coin_data['availableToWithdraw']) # или walletBalance
+            except:
+                pass
 
-# ===== ФУНКЦИИ =====
+        logger.info(f"Баланс: Свободно {free_usdt} USDT | Всего {total_usdt} USDT")
+        
+        return {
+            'free': free_usdt,
+            'total': total_usdt
+        }
 
-def fetch_ohlcv(symbol=config.SYMBOL, timeframe=config.TIMEFRAME, limit=config.LIMIT):
+    except Exception as e:
+        logger.error(f"Ошибка баланса: {e}")
+        return {'free': 0, 'total': 0}
+
+
+# ===== Индикаторы =====
+
+# 1. СЕТЕВАЯ ЧАСТЬ: Теперь асинхронная
+async def fetch_ohlcv_async(symbol=config.SYMBOL, timeframe=config.TIMEFRAME, limit=config.LIMIT):
     try:
-        ohlcv = bybit.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        # Ждем данные от биржи через await
+        ohlcv = await bybit.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        
         logger.info(f"Успешно получены данные {symbol} ({timeframe}), свечей: {len(df)}")
         return df
     except Exception as e:
         logger.error(f"Ошибка получения данных OHLCV для {symbol}: {e}")
         return None
 
-def ema(series, length=config.EMA_LENGTH): #изменил length на length=config.EMA_LENGTH
+# 2. МАТЕМАТИЧЕСКАЯ ЧАСТЬ: Оставляем обычными функциями
+def ema(series, length):
     return series.ewm(span=length, adjust=False).mean()
 
-def calc_obv(df): # Расчёт OBV + сглаживание длиной OBV_LENGTH
+def calculate_indicators(df):
+    """Объединяем расчеты в один блок для удобства"""
+    try:
+        # Расчет EMA для MACD
+        df['macd_line'], df['signal_line'] = calc_macd(df['close'])
+        
+        # Расчет OBV
+        df = calc_obv(df)
+        
+        return df
+    except Exception as e:
+        logger.error(f"Ошибка при расчете индикаторов: {e}")
+        return df
+
+def calc_obv(df):
+    # Твоя логика OBV (быстрая, расчет в памяти)
     df['direction'] = np.sign(df['close'].diff()).fillna(0)
     df['obv_raw'] = (df['volume'] * df['direction']).cumsum()
     df['obv'] = ema(df['obv_raw'], config.OBV_LENGTH) if config.OBV_LENGTH > 1 else df['obv_raw']
     return df
 
-def calc_macd(series,
-              fast=config.MACD_FAST,
-              slow=config.MACD_SLOW, 
-              signal=config.MACD_SIGNAL
-              ):
+def calc_macd(series, fast=config.MACD_FAST, slow=config.MACD_SLOW, signal=config.MACD_SIGNAL):
     macd_line = ema(series, fast) - ema(series, slow)
     signal_line = ema(macd_line, signal)
     return macd_line, signal_line
 
+
+
 def analyze_market(df, symbol=config.SYMBOL):
-    logger.info(f"Начат анализ рынка для {symbol}...")
-    #logging.info(f"Текущая позиция: {current_pos}")
-    # Вычисление сигнала
-    macd_line, signal_line = calc_macd(df['close'])
-    last_macd, last_signal = macd_line.iloc[-1], signal_line.iloc[-1]
-    
-    signal = None
-    if last_macd > last_signal:
-        signal = 'LONG'
-        logging.info(f"Сигнал на ЛОНГ.")
-    elif last_macd < last_signal:
-        signal = 'SHORT'
-        logging.info(f"Сигнал на ШОРТ.")
-    logger.info(f"Анализ завершен. Текущий сигнал: {signal if signal else 'НЕЙТРАЛЬНО'}")
-    return signal
-
-# Здесь логика создания ордера через ccxt (bybit.create_market_order и т.д.)
-def get_position_side():
     """
-    Определяем, есть ли открытая позиция по BTCUSDT.
-    Возвращает: 'long', 'short' или None
+    Синхронная функция анализа. Принимает DataFrame с уже рассчитанными индикаторами.
     """
-    try:
-        positions = bybit.fetch_positions([config.SYMBOL])
-        # Если positions — это не список (бывает при ошибках API),
-        # проверка ниже предотвратит падение
-        if not isinstance(positions, list):
-            logging.info(f"Неожиданный ответ API: {positions}")
-            return None
-
-    except Exception as e:
-        logging.info(f"Ошибка при запросе позиций: {e}")
+    if df is None or len(df) < 2:
+        logger.warning(f"Недостаточно данных для анализа {symbol}")
         return None
 
-    for p in positions:
-        # Проверяем, что p — это словарь, прежде чем вызывать .get()
-        if not isinstance(p, dict):
-            continue
+    # Берем две последние свечи для проверки пересечения (Crossover)
+    last_row = df.iloc[-1]      # Текущая (незакрытая или только что закрытая)
+    prev_row = df.iloc[-2]      # Предыдущая закрытая
 
-        # CCXT обычно приводит символы к единому виду.
-        # Проще сравнивать напрямую с SYMBOL, если он задан верно для CCXT.
-        if p.get('symbol') == config.SYMBOL:
-            # Используем .get() с дефолтным значением 0
-            size = float(p.get('contracts') or 0)
-            side = p.get('side')
+    curr_macd, curr_signal = last_row['macd_line'], last_row['signal_line']
+    prev_macd, prev_signal = prev_row['macd_line'], prev_row['signal_line']
 
-            if size > 0:
-                # Приводим к нижнему регистру для надежности
-                return str(side).lower()
+    signal = None
 
-    return None
+    # ЛОГИКА: Ищем именно МОМЕНТ пересечения
+    # Если сейчас MACD выше, а раньше был ниже — это точка входа
+    if curr_macd > curr_signal and prev_macd <= prev_signal:
+        signal = 'LONG'
+        logger.info(f" СИГНАЛ: Золотое пересечение MACD на {symbol}. Входим в ЛОНГ.")
+    
+    elif curr_macd < curr_signal and prev_macd >= prev_signal:
+        signal = 'SHORT'
+        logger.info(f" СИГНАЛ: Смертельное пересечение MACD на {symbol}. Входим в ШОРТ.")
+    
+    # Если пересечения нет, но мы просто "выше" или "ниже" — signal останется None
+    return signal
 
 
-def close_position():
-    """Закрытие открытой позиции по рынку."""
-    side = get_position_side()
-    if side is None:
-        logging.info("Нет открытой позиции для закрытия.")
-        return
-    order_side: Literal['buy', 'sell']
+#<===Работа с позициями===>
+
+async def get_active_position():
+    """
+    Возвращает словарь с данными позиции или None.
+    Это асинхронный 'Источник истины'.
+    """
     try:
-        # Для закрытия лонга надо продать, для шорта — купить
-        if side == 'long':
-            order_side = 'sell'
-        else:
-            order_side = 'buy'
+        # Ждем ответа асинхронно
+        positions = await bybit.fetch_positions([config.SYMBOL])
+        
+        for p in positions:
+            # У Bybit в CCXT поле 'contracts' или 'size' показывает объем
+            size = float(p.get('contracts', 0))
+            if p.get('symbol') == config.SYMBOL and size > 0:
+                return p # Возвращаем весь объект позиции
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка при запросе позиций: {e}")
+        return None
 
-        logging.info(f"Закрываю {side} позицию по рынку...")
-        bybit.create_order(
+async def close_position(current_pos):
+    """
+    Закрытие позиции. Принимает объект позиции, чтобы знать ТОЧНЫЙ объем.
+    """
+    if not current_pos:
+        logger.info("Нет открытой позиции для закрытия.")
+        return
+
+    try:
+        side = current_pos['side'] # 'long' или 'short'
+        amount = current_pos['contracts'] # Закрываем ВЕСЬ объем, что есть
+        
+        # Инвертируем сторону для закрытия
+        order_side = 'sell' if side == 'long' else 'buy'
+
+        logger.info(f"Закрываю {side} позицию объемом {amount}...")
+        
+        # Асинхронное создание ордера
+        order = await bybit.create_order(
             symbol=config.SYMBOL,
             type='market',
             side=order_side,
-            amount=config.ORDER_AMOUNT
+            amount=amount
         )
-        logging.info(f"Ордер на закрытие отправлен.")
+        # ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ
+        msg = f"<b>ПОЗИЦИЯ ЗАКРЫТА</b>\nСимвол: {config.SYMBOL}"
+        await notifier.send_message(msg)
+        
     except Exception as e:
-        logging.info(f"Ошибка при закрытии позиции: {e}")
+        await notifier.send_message(f"Ошибка при закрытии: {e}")
 
+        logger.info(f"Позиция закрыта. ID ордера: {order['id']}")
+    except Exception as e:
+        logger.error(f"Ошибка при закрытии позиции: {e}")
 
-def open_position(direction):
+async def open_position(direction):
     """
-    Открытие позиции:
-    direction: 'long' или 'short'
+    Открытие позиции асинхронно.
     """
-    if direction not in ['long', 'short']:
-        logging.info(f"Неверное направление: {direction}")
-        return
-    side: Literal['buy', 'sell']
     try:
-        if direction == 'long':
-            side = 'buy'
-        else:
-            side = 'sell'
-
-        logging.info(f"Открываю {direction} позицию ({side}) по рынку, {config.ORDER_AMOUNT} BTC...")
-        bybit.create_order(
+        side = 'buy' if direction == 'long' else 'sell'
+        
+        logger.info(f"Открываем {direction.upper()} на {config.ORDER_AMOUNT}...")
+        
+        order = await bybit.create_order(
             symbol=config.SYMBOL,
             type='market',
             side=side,
             amount=config.ORDER_AMOUNT
         )
-        logging.info(f"Ордер на открытие отправлен.")
-        logging.info(f"ОТКРЫТА ПОЗИЦИЯ: {direction.upper()} | Символ: {config.SYMBOL} | Объем: {config.ORDER_AMOUNT}")
+        # ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ
+        msg = (f"<b>ОТКРЫТА ПОЗИЦИЯ</b>\n"
+               f"Направление: {direction.upper()}\n"
+               f"Инструмент: {config.SYMBOL}\n"
+               f"Объем: {config.ORDER_AMOUNT} BTC")
+        await notifier.send_message(msg)
     except Exception as e:
-        logging.info(f"Ошибка при открытии позиции: {e}")
-        logging.error(f"Ошибка при открытии позиции: {e}")
-def run_bot_once():
-    symbol = config.SYMBOL # Берем символ из конфига
-    trade_amount = config.ORDER_AMOUNT # Объем в BTC (можно вынести в config)
-    
-    df = fetch_ohlcv(symbol)
-    if df is not None:
-        # Расчет индикаторов
-        df = calc_obv(df)
-        
-        # Получение сигнала
-        signal = analyze_market(df, symbol)
+        await notifier.send_message(f"Ошибка открытия позиции: {e}")
 
+        logger.info(f"Ордер исполнен. Открыт {direction.upper()}")
+    except Exception as e:
+        logger.error(f"Ошибка открытия позиции: {e}")
+
+
+async def run_bot_cycle():
+    """
+    Один цикл работы асинхронного бота.
+    """
+    symbol = config.SYMBOL
+    
+    # 1. ШАГ: Проверяем, что происходит на бирже (Источник истины)
+    # Мы делаем это ПЕРВЫМ делом, чтобы знать, в позиции мы или нет
+    current_pos = await get_active_position()
+    
+    # 2. ШАГ: Получаем данные и считаем индикаторы
+    df = await fetch_ohlcv_async(symbol, limit=200) # Оптимизировали до 200
+    if df is None:
+        logger.warning("Пропуск цикла: данные OHLCV не получены.")
+        return
+
+    df = calculate_indicators(df) # Математика (синхронно)
+    
+    # 3. ШАГ: Анализ рынка
+    signal = analyze_market(df, symbol) # Напоминаю, там теперь поиск ПЕРЕСЕЧЕНИЯ
+
+    # 4. ШАГ: Исполнение (Логика управления позицией)
+    
+    # СЛУЧАЙ А: Мы вне рынка (позиции нет)
+    if current_pos is None:
         if signal == 'LONG':
-            open_position('long')
+            await open_position('long')
         elif signal == 'SHORT':
-            open_position('short')
-    else:
-        logger.warning("Пропуск цикла: не удалось получить данные.")
+            await open_position('short')
+        else:
+            logger.info("Сигнала нет, ждем...")
+
+    # СЛУЧАЙ Б: Мы уже в ЛОНГЕ
+    elif current_pos['side'] == 'long':
+        if signal == 'SHORT': # Сигнал сменился — переворачиваемся
+            logger.info("Сигнал сменился на SHORT. Закрываем LONG.")
+            await close_position(current_pos)
+            await open_position('short')
+        else:
+            logger.info("Держим LONG, условий для выхода нет.")
+
+    # СЛУЧАЙ В: Мы уже в ШОРТЕ
+    elif current_pos['side'] == 'short':
+        if signal == 'LONG':
+            logger.info("Сигнал сменился на LONG. Закрываем SHORT.")
+            await close_position(current_pos)
+            await open_position('long')
+        else:
+            logger.info("Держим SHORT, условий для выхода нет.")
+
+async def main():
+    """Главный вход в программу"""
+    logger.info("Запуск основного торгового цикла...")
+
+    # ПРОВЕРКА СВЯЗИ С TELEGRAM
+    try:
+        startup_msg = (
+            "🤖 <b>Биткоин-бот запущен!</b>\n"
+            f"Ожидаю сигналов по {config.SYMBOL}\n"
+            "Связь с биржей и уведомлениями установлена."
+        )
+        await notifier.send_message(startup_msg)
+    except Exception as e:
+        logger.error(f"Не удалось отправить стартовое сообщение в TG: {e}")
+
+    try:
+        while True:
+            await run_bot_cycle()
+            # Ждем начала следующей минуты или фиксированное время
+            # Для 1m таймфрейма лучше ждать секунд 10-30 между проверками
+            await asyncio.sleep(30) 
+    except Exception as e:
+        error_msg = f"Критическая ошибка в main: {e}"
+        logger.error(f"Критическая ошибка в main: {e}")
+    finally:
+        await bybit.close() # Закрываем сессию при выходе
 
 if __name__ == "__main__":
-    while True:
-        try:
-            run_bot_once()
-        except Exception as e:
-            logging.error(f"Глобальная ошибка в цикле: {e}")
-        time.sleep(60)
+    try:
+        # Запускаем событийный цикл и передаем ему нашу главную функцию
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # Красиво ловим Ctrl+C, чтобы бот не плевался ошибками в консоль
+        logger.info("Бот остановлен пользователем. Удачного профита!")
+    except Exception as e:
+        logger.critical(f"Бот упал с ошибкой: {e}")
+
+
