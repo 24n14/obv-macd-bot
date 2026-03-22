@@ -4,21 +4,10 @@ import ccxt.pro as ccxt
 import pandas as pd
 import numpy as np
 import requests
-#import time
-#from typing import Literal
 import config
+from typing import Literal, Optional
 from info_in_telegram import TelegramNotifier
 
-#====Импортируем все настройки из нашего файла config.py====
-proxy_settings = {
-    'host': config.PROXY_HOST,
-    'port': config.PROXY_PORT,
-    'user': config.PROXY_USER,
-    'password': config.PROXY_PASS
-}
-notifier = TelegramNotifier(config.TG_TOKEN,
-                            config.TG_CHAT_ID,
-                            proxy_data=proxy_settings if config.USE_PROXY else None)
 #==== Настройка логирования====
 logging.basicConfig(
     level=logging.INFO,
@@ -31,28 +20,46 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.info("Бот запущен и готов к работе.")
 
+#====Импортируем все настройки из нашего файла config.py====
+proxy_settings = {
+    'host': config.PROXY_HOST,
+    'port': config.PROXY_PORT,
+    'user': config.PROXY_USER,
+    'password': config.PROXY_PASS
+}
+notifier = TelegramNotifier(config.TG_TOKEN,
+                            config.TG_CHAT_ID,
+                            proxy_data=proxy_settings if config.USE_PROXY else None)
+
+
 #<===ПОДКЛЮЧЕНИЕ К ПРОКСИ===>
 proxy_url = f"http://{config.PROXY_USER}:{config.PROXY_PASS}@{config.PROXY_HOST}:{config.PROXY_PORT}"
+
 # Определяем конфиг прокси (если выключено — будет None)
-proxies_config = {
+proxy_config = {
     'http': proxy_url,
     'https': proxy_url,
 } if config.USE_PROXY else None
+
 # ===== ПОДКЛЮЧЕНИЕ К BYBIT =====
-test_ip = requests.get('https://api.ipify.org', proxies={'https': proxy_url}).text
+# Если proxy_config равен None (прокси выключен), requests сделает запрос напрямую
+test_ip = requests.get('https://api.ipify.org', proxies=proxy_config).text
+#test_ip = requests.get('https://api.ipify.org', proxies={'https': proxy_url}).text
 logger.info(f"Внешний IP через прокси: {test_ip}")
+
 # 1. Создаем объект (это всё еще синхронная операция, в интернет не идет)
 bybit = ccxt.bybit({
     'apiKey': config.API_KEY,
     'secret': config.SECRET_KEY,
     'enableRateLimit': True,
-    'proxies': proxies_config,
     'options': {
         'defaultType': 'linear',  # Указываем тип контрактов (USDT-бессрочные)
-        'recvWindow': 5000        # Окно задержки для безопасности
+        'adjustForTimeDifference': True,  # Авто-синхронизация времени
+        'recvWindow': 10000        # Окно задержки для безопасности
     }
 })
-if proxies_config:
+bybit.aiohttp_proxy = proxy_url
+if proxy_config:
     logger.info("Работа через прокси включена.")
 else:
     logger.info("Работа напрямую (без прокси).")
@@ -62,7 +69,7 @@ if config.ENABLE_DEMO:
     logger.info("Режим Demo-торговли Bybit активирован.")
 
 # 3. Твоя важная строчка (Явное подтверждение типа рынка)
-bybit.options['defaultType'] = 'linear' 
+#bybit.options['defaultType'] = 'linear'
 
 # Профессорская заметка:
 # Теперь любая команда к этому объекту (например, fetch_balance) 
@@ -74,21 +81,29 @@ async def get_detailed_balance():
         balance = await bybit.fetch_balance()
         
         # Свободные средства (для новых сделок)
-        free_usdt = balance['free'].get('USDT', 0)
-        
+        free_usdt = balance.get('USDT', {}).get('free', 0)
         # Общий капитал (ваша "стоимость" на бирже)
-        total_usdt = balance['total'].get('USDT', 0)
+        total_usdt = balance.get('USDT', {}).get('total', 0)
         
         # Запасной вариант для специфики Bybit (Unified Account)
+
         if total_usdt == 0:
             try:
-                # На Unified аккаунтах смотрим equity
-                coin_data = balance['info']['result']['list'][0]['coin'][0]
-                total_usdt = float(coin_data['equity'])
-                free_usdt = float(coin_data['availableToWithdraw']) # или walletBalance
-            except:
-                pass
+                # Используем .get() и приведение к dict, чтобы анализатор не ругался
+                info: dict = balance.get('info', {})
+                result_list = info.get('result', {}).get('list', [])
 
+                if result_list:
+                    # У UTA аккаунта данные лежат в первом элементе списка
+                    coins = result_list[0].get('coin', [])
+                    # Ищем именно USDT в списке активов
+                    usdt_data = next((c for c in coins if c.get('coin') == 'USDT'), None)
+
+                    if usdt_data:
+                        total_usdt = float(usdt_data.get('equity', 0))
+                        free_usdt = float(usdt_data.get('availableToWithdraw', 0))
+            except Exception as e:
+                logger.warning(f"Не удалось извлечь детальный баланс UTA: {e}")
         logger.info(f"Баланс: Свободно {free_usdt} USDT | Всего {total_usdt} USDT")
         
         return {
@@ -101,9 +116,9 @@ async def get_detailed_balance():
         return {'free': 0, 'total': 0}
 
 
-# ===== Индикаторы =====
+# <===== ИНДИКАТОРЫ =====>
 
-# 1. СЕТЕВАЯ ЧАСТЬ: Теперь асинхронная
+# === получение свечей ====
 async def fetch_ohlcv_async(symbol=config.SYMBOL, timeframe=config.TIMEFRAME, limit=config.LIMIT):
     try:
         # Ждем данные от биржи через await
@@ -209,13 +224,14 @@ async def close_position(current_pos):
     if not current_pos:
         logger.info("Нет открытой позиции для закрытия.")
         return
-
+    order: Optional[dict] = None  # Инициализируем None, чтобы избежать ошибки
     try:
         side = current_pos['side'] # 'long' или 'short'
         amount = current_pos['contracts'] # Закрываем ВЕСЬ объем, что есть
-        
-        # Инвертируем сторону для закрытия
-        order_side = 'sell' if side == 'long' else 'buy'
+
+        # Инвертируем сторону для закрытия с явным Literal
+        order_side: Literal['buy', 'sell'] = 'sell' if side == 'long' else 'buy'
+        #order_side = 'sell' if side == 'long' else 'buy'
 
         logger.info(f"Закрываю {side} позицию объемом {amount}...")
         
@@ -232,10 +248,9 @@ async def close_position(current_pos):
         
     except Exception as e:
         await notifier.send_message(f"Ошибка при закрытии: {e}")
+        logger.error(f"Ошибка при закрытии позиции: {str(e)}")
 
         logger.info(f"Позиция закрыта. ID ордера: {order['id']}")
-    except Exception as e:
-        logger.error(f"Ошибка при закрытии позиции: {e}")
 
 async def open_position(direction):
     """

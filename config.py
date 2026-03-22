@@ -13,7 +13,7 @@ TG_CHAT_ID = os.getenv('TG_CHAT_ID')
 # ===== ПАРАМЕТРЫ ТОРГОВЛИ =====
 SYMBOL = 'BTC/USDT:USDT'
 CATEGORY = 'linear'
-TIMEFRAME = '15m'
+TIMEFRAME = '5m'
 ORDER_AMOUNT = 0.01  # размер позиции в BTC
 LIMIT = 200
 
